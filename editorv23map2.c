@@ -161,6 +161,12 @@ void enableRawMode()
         die("tcgetattr");
     atexit(disableRawMode);
 
+    tcflush(STDIN_FILENO, TCIFLUSH);
+    
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
+        die("tcgetattr");
+    atexit(disableRawMode);
+
     struct termios raw = orig_termios;
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON |
                      IGNBRK | PARMRK | INLCR | IGNCR);
@@ -777,57 +783,9 @@ void borrar_caracter_derecha()
         actual->longitud--;
     }
 }
+// --- Guardar en disco ---
 
-// --- Guardar como ---
 
-// --- Guardar Como (nuevo archivo) ---
-
-/* void editor_save_as(void)
-{
-    char nuevo_nombre[MAX_FILENAME];
-    char buffer[256];
-
-    // Mostrar mensaje
-    editor_draw_footer(" Nombre del nuevo archivo: ");
-    fflush(stdout);
-
-    // Volver a modo canónico para leer entrada
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-
-    // Leer nombre del archivo
-    printf("\x1b[%d;1H", E.screenrows + 3);
-    printf("\x1b[K");
-    printf("Nombre del archivo: ");
-    fflush(stdout);
-
-    if (fgets(nuevo_nombre, sizeof(nuevo_nombre), stdin))
-    {
-        // Quitar salto de línea
-        nuevo_nombre[strcspn(nuevo_nombre, "\n")] = '\0';
-
-        if (strlen(nuevo_nombre) > 0)
-        {
-            // Actualizar nombre del archivo
-            strncpy(E.filename, nuevo_nombre, MAX_FILENAME - 1);
-            E.filename[MAX_FILENAME - 1] = '\0';
-
-            // Guardar con el nuevo nombre
-            pthread_mutex_lock(&E.mutex_buffer);
-            editor_save_to_disk();
-            pthread_mutex_unlock(&E.mutex_buffer);
-
-            snprintf(buffer, sizeof(buffer), " Archivo guardado como: %s ", E.filename);
-            editor_draw_footer(buffer);
-        }
-        else
-        {
-            editor_draw_footer(" Guardado cancelado ");
-        }
-    }
-
-    // Volver a modo raw
-    enableRawMode();
-}*/
 
 // --- Salida ---
 
@@ -896,11 +854,23 @@ Linea *obtener_linea_por_indice(int indice)
     return l;
 }
 
+
 // --- Procesamiento de teclas ---
 
 void editor_process_keypress()
 {
     char c;
+    ssize_t nread = read(STDIN_FILENO, &c, 1);
+
+    if (nread == 0)
+        return;              // no llegó ninguna tecla nueva: no hacer nada
+    if (nread == -1)
+    {
+        if (errno != EAGAIN)
+            die("read");
+        return;
+    }
+
     if (read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN)
         return;
 
