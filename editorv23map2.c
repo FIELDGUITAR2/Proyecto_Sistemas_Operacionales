@@ -258,9 +258,7 @@ void editor_shutdown(void) {
     // Método 1: Secuencias ANSI (funciona en la mayoría de terminales)
     printf("\x1b[2J\x1b[H");
     fflush(stdout);
-    
-    // Método 2: Como respaldo, usar system si está disponible
-    
+
     system("clear");
 }
 
@@ -362,6 +360,8 @@ void load_syntax_config()
     }
     fclose(fp);
 }
+
+// --- Inicializar editor ---
 
 void initEditor()
 {
@@ -928,7 +928,7 @@ void editor_process_keypress()
 
 int main(int argc, char *argv[])
 {
-    
+
     enableRawMode();
     initEditor();
 
