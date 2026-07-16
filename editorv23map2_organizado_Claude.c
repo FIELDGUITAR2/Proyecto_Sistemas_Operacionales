@@ -1,44 +1,51 @@
 #define _GNU_SOURCE
 
-#include <unistd.h>  // Para access() - ya lo tienes incluido
+#include <unistd.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <time.h>
 #include <fcntl.h>     // open()
 #include <sys/stat.h>  // mkfifo()
-#include <sys/ioctl.h> // Control tamaño de pantalla
+#include <sys/ioctl.h> // tamaño de la terminal
+#include <sys/select.h> // select() en limpiar_buffer_entrada()
 
-// --- Macros de Teclas ---
+// =====================================================================
+//  MACROS Y CONSTANTES
+// =====================================================================
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define MAX_FILENAME 256
 #define FIFO_PATH "/tmp/CopyPaste_fifo"
 
-// --- LIBRERÍA MAP (implementación integrada) ---
+// =====================================================================
+//  LIBRERÍA "MAP" (mapa palabra -> color ANSI, para el resaltado de sintaxis)
+// =====================================================================
 
 #define MAX_MAPA_COLORES 48
 #define MAX_PALABRA_MAP 32
 #define MAX_CODIGO_MAP 16
 
+// Una entrada del mapa: una palabra reservada y el código de color ANSI que le corresponde.
 typedef struct EntradaMapa
 {
     char palabra[MAX_PALABRA_MAP];
-    char codigo[MAX_CODIGO_MAP]; // almacena el número ANSI como string (ej. "31")
+    char codigo[MAX_CODIGO_MAP]; // código ANSI guardado como texto (ej. "31")
     int activa;
 } EntradaMapa;
 
+// Conjunto de palabras reservadas + color, típicamente uno por extensión de archivo (.c, .py, etc).
 typedef struct MapaColores
 {
     EntradaMapa entradas[MAX_MAPA_COLORES];
     int cantidad;
 } MapaColores;
 
+// Deja un MapaColores vacío y listo para usarse.
 void mapa_inicializar(MapaColores *mapa)
 {
     mapa->cantidad = 0;
@@ -50,20 +57,21 @@ void mapa_inicializar(MapaColores *mapa)
     }
 }
 
+// Agrega (o actualiza, si ya existe) una palabra con su color ANSI dentro del mapa.
 int mapa_agregar(MapaColores *mapa, const char *palabra, int codigo_ansi)
 {
     if (mapa->cantidad >= MAX_MAPA_COLORES)
         return -1;
-    // Verificar que no exista ya
+
     for (int i = 0; i < mapa->cantidad; i++)
     {
         if (strcmp(mapa->entradas[i].palabra, palabra) == 0)
         {
-            // Actualizar código
             snprintf(mapa->entradas[i].codigo, MAX_CODIGO_MAP, "%d", codigo_ansi);
             return 0;
         }
     }
+
     strncpy(mapa->entradas[mapa->cantidad].palabra, palabra, MAX_PALABRA_MAP - 1);
     mapa->entradas[mapa->cantidad].palabra[MAX_PALABRA_MAP - 1] = '\0';
     snprintf(mapa->entradas[mapa->cantidad].codigo, MAX_CODIGO_MAP, "%d", codigo_ansi);
@@ -72,11 +80,12 @@ int mapa_agregar(MapaColores *mapa, const char *palabra, int codigo_ansi)
     return 0;
 }
 
+// Busca "token" (de longitud "len") dentro del mapa. Devuelve su código ANSI o NULL si no existe.
 const char *mapa_buscar(const MapaColores *mapa, const char *token, int len)
 {
     if (mapa == NULL || token == NULL)
         return NULL;
-    // Comparar con cada entrada
+
     for (int i = 0; i < mapa->cantidad; i++)
     {
         if (strlen(mapa->entradas[i].palabra) == (size_t)len &&
@@ -88,74 +97,91 @@ const char *mapa_buscar(const MapaColores *mapa, const char *token, int len)
     return NULL;
 }
 
-// --- Estructuras de Datos del Editor ---
+// =====================================================================
+//  ESTRUCTURAS DE DATOS DEL EDITOR
+// =====================================================================
 
+// Cada línea de texto del documento es un nodo de una lista doblemente enlazada.
 typedef struct Linea
 {
-    char *texto;           // Texto real de la línea
-    int longitud;          // Longitud de linea
-    int capacidad;         // Capacidad máxima del texto
-    char *texto_resaltado; // Copia con códigos ANSI para syntax highlighting
+    char *texto;           // contenido real de la línea
+    int longitud;          // longitud en caracteres
+    int capacidad;         // tamaño reservado en memoria para "texto"
+    char *texto_resaltado; // copia de "texto" con códigos ANSI de color (o NULL si no se ha resaltado)
     struct Linea *siguiente;
     struct Linea *anterior;
 } Linea;
 
-// --- Estado Global del Editor ---
-
+// Estado global del editor: cursor, documento, configuración e hilos.
 typedef struct EstadoEditor
 {
-    int cx, cy;                 // Posición del cursor en pantalla
-    int filas_totales;          // Cantidad de filas en el documento
-    int rowoff, coloff;         // Offsets para el scrolling
-    int screenrows, screencols; // Tamaño de la terminal
-    Linea *primer_linea;        // Primera Línea
+    int cx, cy;                 // posición del cursor (columna, fila) dentro del documento
+    int filas_totales;          // cantidad de líneas del documento
+    int rowoff, coloff;         // desplazamiento de scroll (fila/columna superior visible)
+    int screenrows, screencols; // tamaño de la terminal
+    Linea *primer_linea;
     Linea *linea_actual;
     char filename[MAX_FILENAME];
 
-    // Configuración (.editorrc)
+    // Configuración cargada desde ".editorrc"
     char bg_color[20];
     char fg_color[20];
     int mostrar_reloj;
     int autosave_time;
 
-    // Hilos y Sincronización
+    // Sincronización entre el hilo principal y los hilos de fondo
     pthread_mutex_t mutex_buffer;
     int running;
 
-    // Mapas de sintaxis (uno por extensión)
+    // Mapas de sintaxis (uno por extensión de archivo soportada)
     MapaColores mapas_sintaxis[10];
     int num_mapas;
 } EstadoEditor;
 
-EstadoEditor E; // Instancia global
+EstadoEditor E; // instancia única y global del estado del editor
+struct termios orig_termios; // configuración original de la terminal (para restaurarla al salir)
 
-struct termios orig_termios;
-
-// --- Declaraciones de Funciones ---
+// =====================================================================
+//  DECLARACIONES DE FUNCIONES
+// =====================================================================
 
 void editor_refresh_screen();
 void editor_draw_footer(const char *mensaje);
 void die(const char *s);
 void editor_save_to_disk(void);
+void editor_save_as(void);
+void accion_copiar(void);
+void accion_pegar(void);
 void load_syntax_config();
 void resaltar_linea_sin_regex(Linea *linea, const MapaColores *mapa);
+Linea *obtener_linea_por_indice(int indice);
 
-// --- Manejo de errores ---
+// =====================================================================
+//  MANEJO DE ERRORES
+// =====================================================================
 
+// Imprime un mensaje de error del sistema (perror) y termina el programa.
 void die(const char *s)
 {
     perror(s);
     exit(1);
 }
 
-// --- Manejo de la Terminal ---
+// =====================================================================
+//  MANEJO DE LA TERMINAL (modo "raw")
+// =====================================================================
 
+// Restaura la configuración original de la terminal y limpia la pantalla al salir.
+// Se registra con atexit() para que se ejecute siempre, incluso si el programa
+// termina de forma inesperada.
 void disableRawMode()
 {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
     printf("\x1b[2J\x1b[H");
 }
 
+// Pone la terminal en modo "raw": sin eco, sin buffer por línea y sin procesamiento
+// especial de señales, para poder leer cada tecla al instante.
 void enableRawMode()
 {
     if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
@@ -169,15 +195,40 @@ void enableRawMode()
     raw.c_cflag &= ~(CSIZE | PARENB);
     raw.c_cflag |= (CS8);
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
+    raw.c_cc[VMIN] = 0;  // read() puede devolver 0 si no hay tecla disponible
+    raw.c_cc[VTIME] = 1; // espera como máximo 0.1s por una tecla
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
         perror("tcsetattr");
 }
 
-// --- Tamaño de pantalla ---
+// Descarta cualquier entrada de teclado pendiente en el buffer del kernel.
+// Se usa al iniciar el programa para que teclas de una sesión anterior
+// (por ejemplo, una tecla mantenida presionada justo antes de cerrar la terminal)
+// no se "reproduzcan" como si el usuario las hubiera presionado ahora.
+void limpiar_buffer_entrada()
+{
+    char c;
+    fd_set fds;
 
+    tcflush(STDIN_FILENO, TCIFLUSH);
+
+    while (1)
+    {
+        struct timeval tv = {0, 0};
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+
+        if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0)
+            break; // no hay más datos pendientes
+
+        if (read(STDIN_FILENO, &c, 1) <= 0)
+            break;
+        // el caracter leído se descarta a propósito
+    }
+}
+
+// Obtiene el tamaño actual de la terminal (filas y columnas).
 int getWindowSize(int *rows, int *cols)
 {
     struct winsize ws;
@@ -186,16 +237,17 @@ int getWindowSize(int *rows, int *cols)
         perror("Error en ejecucion de ioctl");
         return -1;
     }
-    else
-    {
-        *cols = ws.ws_col;
-        *rows = ws.ws_row;
-        return 0;
-    }
+    *cols = ws.ws_col;
+    *rows = ws.ws_row;
+    return 0;
 }
 
-// --- Manejo de Memoria ---
+// =====================================================================
+//  MANEJO DE MEMORIA DEL DOCUMENTO (lista de líneas)
+// =====================================================================
 
+// Crea una nueva línea con el texto "s" (de longitud "len") y la agrega
+// al final de la lista de líneas del documento.
 void append_line(const char *s, size_t len)
 {
     pthread_mutex_lock(&E.mutex_buffer);
@@ -228,6 +280,7 @@ void append_line(const char *s, size_t len)
     pthread_mutex_unlock(&E.mutex_buffer);
 }
 
+// Libera toda la lista de líneas del documento (todas las Linea y su texto).
 void free_all_lines(void)
 {
     Linea *actual = E.primer_linea;
@@ -243,10 +296,23 @@ void free_all_lines(void)
     E.linea_actual = NULL;
 }
 
-// --- Limpiar terminal ---
+// Recorre la lista de líneas y devuelve la línea en la posición "indice" (0 = primera).
+Linea *obtener_linea_por_indice(int indice)
+{
+    Linea *l = E.primer_linea;
+    for (int i = 0; i < indice && l != NULL; i++)
+        l = l->siguiente;
+    return l;
+}
 
-void editor_shutdown(void) {
+// =====================================================================
+//  SALIDA / LIMPIEZA DEL PROGRAMA
+// =====================================================================
 
+// Detiene los hilos, libera toda la memoria del documento, elimina el FIFO
+// de copiar/pegar y limpia la pantalla. Se llama al presionar Ctrl+Q.
+void editor_shutdown(void)
+{
     E.running = 0;
 
     pthread_mutex_lock(&E.mutex_buffer);
@@ -256,15 +322,17 @@ void editor_shutdown(void) {
     pthread_mutex_destroy(&E.mutex_buffer);
     unlink(FIFO_PATH);
 
-    // Método 1: Secuencias ANSI (funciona en la mayoría de terminales)
     printf("\x1b[2J\x1b[H");
     fflush(stdout);
-
     system("clear");
 }
 
-// --- Configuración (.editorrc) ---
+// =====================================================================
+//  CONFIGURACIÓN (.editorrc)
+// =====================================================================
 
+// Carga valores por defecto y luego, si existe, los sobreescribe con lo indicado
+// en el archivo ".editorrc" del directorio actual.
 void load_config()
 {
     strcpy(E.bg_color, "40");
@@ -284,16 +352,19 @@ void load_config()
             if (strncmp(line, "autoguardado=", 13) == 0)
                 E.autosave_time = atoi(line + 13);
             if (strncmp(line, "bg_color=", 9) == 0)
-            {
                 strncpy(E.bg_color, line + 9, strcspn(line + 9, "\r\n"));
-            }
         }
         fclose(fp);
     }
 }
 
-// --- Carga de configuración de sintaxis (usando el mapa) ---
+// =====================================================================
+//  CONFIGURACIÓN DE SINTAXIS (~/.editor_syntax.conf)
+// =====================================================================
 
+// Carga los mapas de resaltado de sintaxis. Si el usuario tiene un archivo
+// "~/.editor_syntax.conf", lo interpreta (secciones "[ext]" + líneas "keyword palabra color").
+// Si no existe, crea un mapa básico de C para las extensiones .c y .h.
 void load_syntax_config()
 {
     E.num_mapas = 0;
@@ -305,34 +376,33 @@ void load_syntax_config()
     snprintf(path, sizeof(path), "%s/.editor_syntax.conf", home);
     FILE *fp = fopen(path, "r");
 
-    // Si no existe, crear mapa por defecto para C
     if (!fp)
     {
-        // Inicializar un mapa para extensión "c"
         MapaColores *mapa = &E.mapas_sintaxis[E.num_mapas++];
         mapa_inicializar(mapa);
-        // Palabras reservadas básicas de C con sus colores
+
         struct
         {
             const char *palabra;
             int color;
         } def[] = {
-            {"int", 31}, {"char", 34}, {"void", 35}, {"return", 36}, {"if", 33}, {"else", 33}, {"for", 32}, {"while", 32}, {"struct", 35}, {"typedef", 35}, {"static", 35}, {"include", 33}, {"define", 33}};
-        for (int i = 0; i < sizeof(def) / sizeof(def[0]); i++)
-        {
+            {"int", 31}, {"char", 34}, {"void", 35}, {"return", 36},
+            {"if", 33}, {"else", 33}, {"for", 32}, {"while", 32},
+            {"struct", 35}, {"typedef", 35}, {"static", 35},
+            {"include", 33}, {"define", 33}};
+
+        for (size_t i = 0; i < sizeof(def) / sizeof(def[0]); i++)
             mapa_agregar(mapa, def[i].palabra, def[i].color);
-        }
-        // También para .h
+
+        // Mismo mapa para archivos .h
         MapaColores *mapa_h = &E.mapas_sintaxis[E.num_mapas++];
         mapa_inicializar(mapa_h);
-        for (int i = 0; i < sizeof(def) / sizeof(def[0]); i++)
-        {
+        for (size_t i = 0; i < sizeof(def) / sizeof(def[0]); i++)
             mapa_agregar(mapa_h, def[i].palabra, def[i].color);
-        }
+
         return;
     }
 
-    // Parsear archivo
     char line[256];
     MapaColores *mapa_actual = NULL;
     while (fgets(line, sizeof(line), fp))
@@ -354,16 +424,18 @@ void load_syntax_config()
             char kw[64];
             int color;
             if (sscanf(line + 8, "%s %d", kw, &color) == 2)
-            {
                 mapa_agregar(mapa_actual, kw, color);
-            }
         }
     }
     fclose(fp);
 }
 
-// --- Inicializar editor ---
+// =====================================================================
+//  INICIALIZACIÓN DEL EDITOR
+// =====================================================================
 
+// Inicializa el estado global: cursor en (0,0), tamaño de pantalla, configuración,
+// mapas de sintaxis y el FIFO usado para copiar/pegar.
 void initEditor()
 {
     E.cx = 0;
@@ -383,19 +455,22 @@ void initEditor()
         E.screenrows = 24;
         E.screencols = 80;
     }
-    E.screenrows -= 2; // Cabecera + pie
+    E.screenrows -= 2; // reservar filas para la cabecera y el pie de página
 
     load_config();
     load_syntax_config();
 
     if (mkfifo(FIFO_PATH, 0644) == -1 && errno != EEXIST)
-    {
         perror("mkfifo");
-    }
 }
 
-// --- Guardado ---
+// =====================================================================
+//  GUARDADO EN DISCO
+// =====================================================================
 
+// Escribe todo el documento (todas las líneas, cada una seguida de '\n') en
+// el archivo indicado por E.filename, sobrescribiéndolo por completo.
+// El llamador es responsable de tomar el mutex antes de invocar esta función.
 void editor_save_to_disk(void)
 {
     FILE *out = fopen(E.filename, "w");
@@ -416,14 +491,16 @@ void editor_save_to_disk(void)
     }
 }
 
-// --- Hilo de autoguardado ---
-
+// Hilo en segundo plano que guarda el documento automáticamente cada
+// "E.autosave_time" segundos mientras el editor esté en ejecución.
 void *autosave_thread(void *arg)
 {
     (void)arg;
     while (E.running)
     {
         sleep(E.autosave_time);
+        if (!E.running)
+            break;
         pthread_mutex_lock(&E.mutex_buffer);
         editor_save_to_disk();
         pthread_mutex_unlock(&E.mutex_buffer);
@@ -432,8 +509,12 @@ void *autosave_thread(void *arg)
     return NULL;
 }
 
-// --- Resaltado sin expresiones regulares (usando mapa) ---
+// =====================================================================
+//  RESALTADO DE SINTAXIS
+// =====================================================================
 
+// Genera "texto_resaltado" a partir de "texto", envolviendo cada palabra
+// reservada encontrada en el mapa con sus códigos de color ANSI.
 void resaltar_linea_sin_regex(Linea *linea, const MapaColores *mapa)
 {
     free(linea->texto_resaltado);
@@ -451,36 +532,27 @@ void resaltar_linea_sin_regex(Linea *linea, const MapaColores *mapa)
     int i = 0;
     while (i < (int)len)
     {
-        // Saltar caracteres que no son parte de una palabra (letras, dígitos, '_')
-        if (!isalnum(text[i]) && text[i] != '_')
+        if (!isalnum((unsigned char)text[i]) && text[i] != '_')
         {
             out[pos++] = text[i];
             i++;
             continue;
         }
 
-        // Inicio de una palabra
         int start = i;
-        while (i < (int)len && (isalnum(text[i]) || text[i] == '_'))
-        {
+        while (i < (int)len && (isalnum((unsigned char)text[i]) || text[i] == '_'))
             i++;
-        }
         int word_len = i - start;
 
-        // Buscar en el mapa
         const char *color = mapa_buscar(mapa, text + start, word_len);
         if (color != NULL)
         {
-            // Agregar código de color
             pos += snprintf(out + pos, cap - pos, "\x1b[%sm", color);
-            // Agregar la palabra
             pos += snprintf(out + pos, cap - pos, "%.*s", word_len, text + start);
-            // Resetear color
             pos += snprintf(out + pos, cap - pos, "\x1b[0m");
         }
         else
         {
-            // Copiar la palabra sin formato
             for (int j = start; j < i; j++)
                 out[pos++] = text[j];
         }
@@ -490,44 +562,21 @@ void resaltar_linea_sin_regex(Linea *linea, const MapaColores *mapa)
     linea->texto_resaltado = out;
 }
 
-// --- Hilo de sintaxis ---
-
+// Hilo en segundo plano que, cada 2 segundos, resalta todas las líneas del
+// documento usando el mapa de sintaxis que corresponda a la extensión del archivo actual.
 void *syntax_thread(void *arg)
 {
     (void)arg;
     while (E.running)
     {
         sleep(2);
+        if (!E.running)
+            break;
         pthread_mutex_lock(&E.mutex_buffer);
 
-        // Buscar el mapa correspondiente a la extensión del archivo
-        const MapaColores *mapa = NULL;
-        const char *ext = strrchr(E.filename, '.');
-        if (ext)
-        {
-            ext++; // saltar el punto
-            for (int i = 0; i < E.num_mapas; i++)
-            {
-                // Asumimos que el mapa está indexado por extensión, pero no almacenamos la extensión en el mapa.
-                // Necesitamos una forma de saber qué mapa corresponde a qué extensión.
-                // Para simplificar, usaremos un arreglo de estructuras que asocien extensión y mapa.
-                // Como no tenemos esa asociación, usaremos un truco: los mapas se cargan en orden de aparición en el archivo,
-                // y en el archivo la sección [c] corresponde al primer mapa, [py] al segundo, etc.
-                // Pero no guardamos el nombre de la extensión en el mapa. Para resolverlo, podemos agregar un campo "ext" al mapa.
-                // Lo haré en la estructura MapaColores (añadir char extension[10]).
-                // Pero como la librería map está fija, modificaré la estructura localmente.
-                // Por simplicidad, en este ejemplo asumiremos que el primer mapa es para "c" y el segundo para "h" (por defecto).
-                // Esto es limitado, pero se puede extender fácilmente guardando la extensión en el mapa.
-                // Para una solución completa, modificaría MapaColores para incluir la extensión.
-                // Dado que la librería map es fija, podemos crear un arreglo paralelo de extensiones.
-                // Lo haré: en EstadoEditor, tendré un arreglo de strings para las extensiones.
-            }
-        }
-        // Por ahora, usaremos el primer mapa si existe (para C)
-        if (E.num_mapas > 0)
-        {
-            mapa = &E.mapas_sintaxis[0];
-        }
+        // NOTA: por ahora siempre usa el primer mapa cargado (pensado para C),
+        // sin importar la extensión real del archivo. Ver informe de bugs.
+        const MapaColores *mapa = (E.num_mapas > 0) ? &E.mapas_sintaxis[0] : NULL;
 
         if (mapa)
         {
@@ -543,8 +592,12 @@ void *syntax_thread(void *arg)
     return NULL;
 }
 
-// --- Interfaz gráfica ---
+// =====================================================================
+//  INTERFAZ GRÁFICA (dibujado en pantalla)
+// =====================================================================
 
+// Construye la línea de cabecera (nombre de archivo, nº de líneas, posición
+// del cursor y reloj opcional) y la agrega al buffer de pantalla.
 void editor_draw_header(char *buffer)
 {
     char header[256];
@@ -553,30 +606,31 @@ void editor_draw_header(char *buffer)
 
     char reloj[16] = "";
     if (E.mostrar_reloj)
-        sprintf(reloj, " | %02d:%02d", tm.tm_hour, tm.tm_min);
+        snprintf(reloj, sizeof(reloj), " | %02d:%02d", tm.tm_hour, tm.tm_min);
 
     snprintf(header, sizeof(header),
-             "\x1b[7m %s - %d lineas | Col: %d, Fila: %d%s \x1b[K\x1b[m\r\n",
+             "\x1b[7m %.100s - %d lineas | Col: %d, Fila: %d%s \x1b[K\x1b[m\r\n",
              E.filename, E.filas_totales, E.cx, E.cy, reloj);
 
     strcat(buffer, header);
 }
 
+// Dibuja el pie de página: un mensaje puntual ("msg") o, si es NULL, la
+// barra de atajos de teclado por defecto.
 void editor_draw_footer(const char *msg)
 {
     printf("\x1b[%d;1H", E.screenrows + 2);
     printf("\x1b[7m");
     if (msg != NULL)
-    {
         printf("%-80s", msg);
-    }
     else
-    {
         printf(" ^O Abrir | ^S Guardar | ^A G. Como | ^C Copiar | ^V Pegar | ^X Cortar | ^Q Salir ");
-    }
     printf("\x1b[m\x1b[K");
+    fflush(stdout);
 }
 
+// Redibuja toda la pantalla: cabecera, líneas visibles del documento y pie de página,
+// y reposiciona el cursor.
 void editor_refresh_screen()
 {
     char *buffer = malloc(8192);
@@ -615,8 +669,11 @@ void editor_refresh_screen()
     free(buffer);
 }
 
-// --- Copiar / Pegar FIFO ---
+// =====================================================================
+//  COPIAR / CORTAR / PEGAR (usando un FIFO como portapapeles)
+// =====================================================================
 
+// Copia el texto de la línea actual al FIFO de portapapeles.
 void accion_copiar(void)
 {
     if (E.linea_actual == NULL)
@@ -628,13 +685,12 @@ void accion_copiar(void)
         return;
     }
     if (E.linea_actual->texto != NULL && E.linea_actual->longitud > 0)
-    {
         write(fd, E.linea_actual->texto, E.linea_actual->longitud);
-    }
     close(fd);
     editor_draw_footer("Contenido copiado ....");
 }
 
+// Lee lo que haya en el FIFO de portapapeles y lo inserta en la posición actual del cursor.
 void accion_pegar(void)
 {
     if (E.linea_actual == NULL)
@@ -665,11 +721,7 @@ void accion_pegar(void)
     }
 
     if (E.cx < actual->longitud)
-    {
-        memmove(&actual->texto[E.cx + bytes_leidos],
-                &actual->texto[E.cx],
-                actual->longitud - E.cx);
-    }
+        memmove(&actual->texto[E.cx + bytes_leidos], &actual->texto[E.cx], actual->longitud - E.cx);
 
     memcpy(&actual->texto[E.cx], info_buffer, bytes_leidos);
     actual->longitud = nueva_longitud;
@@ -679,8 +731,11 @@ void accion_pegar(void)
     editor_draw_footer("Contenido pegado ....");
 }
 
-// --- Inserción de caracteres ---
+// =====================================================================
+//  EDICIÓN DE TEXTO (insertar / borrar caracteres y líneas)
+// =====================================================================
 
+// Inserta el carácter "c" en la posición actual del cursor, dentro de la línea actual.
 void insertar_caracter(char c)
 {
     if (E.linea_actual == NULL)
@@ -700,9 +755,7 @@ void insertar_caracter(char c)
     }
 
     if (E.cx < actual->longitud)
-    {
         memmove(&actual->texto[E.cx + 1], &actual->texto[E.cx], actual->longitud - E.cx);
-    }
 
     actual->texto[E.cx] = c;
     actual->longitud = nueva_longitud;
@@ -710,8 +763,8 @@ void insertar_caracter(char c)
     E.cx++;
 }
 
-// --- Borrado ---
-
+// Borra el carácter a la izquierda del cursor (Backspace). Si el cursor está al
+// inicio de la línea, la fusiona con la línea anterior.
 void borrar_caracter_izquierda()
 {
     if (E.linea_actual == NULL)
@@ -719,9 +772,9 @@ void borrar_caracter_izquierda()
 
     if (E.cx == 0)
     {
-        // Unir con línea anterior
         if (E.linea_actual->anterior == NULL)
             return;
+
         Linea *prev = E.linea_actual->anterior;
         int prev_len = prev->longitud;
         int curr_len = E.linea_actual->longitud;
@@ -747,20 +800,17 @@ void borrar_caracter_izquierda()
         E.linea_actual = prev;
         E.filas_totales--;
         E.cx = prev_len;
+        E.cy--;
         return;
     }
 
     Linea *actual = E.linea_actual;
-    if (E.cx > 0)
-    {
-        memmove(&actual->texto[E.cx - 1],
-                &actual->texto[E.cx],
-                actual->longitud - E.cx + 1);
-        actual->longitud--;
-        E.cx--;
-    }
+    memmove(&actual->texto[E.cx - 1], &actual->texto[E.cx], actual->longitud - E.cx + 1);
+    actual->longitud--;
+    E.cx--;
 }
 
+// Borra el carácter a la derecha del cursor (tecla Delete / Supr).
 void borrar_caracter_derecha()
 {
     if (E.linea_actual == NULL)
@@ -768,14 +818,13 @@ void borrar_caracter_derecha()
     Linea *actual = E.linea_actual;
     if (E.cx < actual->longitud)
     {
-        memmove(&actual->texto[E.cx],
-                &actual->texto[E.cx + 1],
-                actual->longitud - E.cx);
+        memmove(&actual->texto[E.cx], &actual->texto[E.cx + 1], actual->longitud - E.cx);
         actual->longitud--;
     }
 }
 
-
+// Inserta un salto de línea (Enter): parte la línea actual en el cursor y
+// mueve el resto del texto a una nueva línea justo debajo.
 void insertar_nueva_linea()
 {
     if (E.linea_actual == NULL)
@@ -783,181 +832,151 @@ void insertar_nueva_linea()
 
     Linea *actual = E.linea_actual;
 
-    // Crear nueva línea con el texto después del cursor
     Linea *nueva = malloc(sizeof(Linea));
     nueva->texto = malloc(actual->longitud - E.cx + 1);
     nueva->texto_resaltado = NULL;
 
-    // Copiar el texto desde la posición del cursor hasta el final
     strcpy(nueva->texto, &actual->texto[E.cx]);
     nueva->longitud = actual->longitud - E.cx;
     nueva->capacidad = nueva->longitud + 1;
 
-    // Truncar la línea actual en la posición del cursor
     actual->texto[E.cx] = '\0';
     actual->longitud = E.cx;
 
-    // Insertar la nueva línea en la lista
     nueva->siguiente = actual->siguiente;
     nueva->anterior = actual;
     if (actual->siguiente)
-    {
         actual->siguiente->anterior = nueva;
-    }
     actual->siguiente = nueva;
 
-    // Mover cursor a la nueva línea
     E.linea_actual = nueva;
     E.cy++;
     E.cx = 0;
     E.filas_totales++;
 }
 
-// --- Limpiar buffer ---
+// =====================================================================
+//  GUARDAR COMO (Ctrl+A)
+// =====================================================================
 
-void limpiar_buffer_entrada() {
-    char c;
-    fd_set fds;
-
-    // Limpiar buffer del kernel
-    tcflush(STDIN_FILENO, TCIFLUSH);
-
-    // Leer y descartar caracteres residuales
-    while (1) {
-        struct timeval tv = {0, 0};  // <--- MOVER AQUÍ DENTRO
-        FD_ZERO(&fds);
-        FD_SET(STDIN_FILENO, &fds);
-
-        if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) {
-            break; // No hay más datos
-        }
-
-        if (read(STDIN_FILENO, &c, 1) <= 0) {
-            break; // Error o no hay más datos
-        }
-        // El caracter se descarta automáticamente
-    }
-}
-
-// Obtener linea por indice
-
-Linea *obtener_linea_por_indice(int indice)
+// Pide al usuario un nombre de archivo por teclado, pregunta antes de
+// sobrescribir si ya existe, y guarda el documento completo con ese nombre.
+//
+// Correcciones aplicadas respecto a la versión anterior:
+//   1) Antes se llamaba a editor_draw_footer(mensaje) seguido de editor_refresh_screen().
+//      Como editor_refresh_screen() vuelve a dibujar el pie de página por defecto al final
+//      (editor_draw_footer(NULL)), el mensaje "Guardar como: ..." quedaba tapado de inmediato
+//      y el usuario escribía "a ciegas", sin ver lo que iba tecleando.
+//      -> Ahora se dibuja el pie de página directamente (sin refrescar toda la pantalla),
+//         así el mensaje permanece visible mientras se escribe el nombre.
+//   2) El guardado final no protegía el acceso a la lista de líneas con el mutex,
+//      pudiendo chocar con el hilo de autoguardado.
+//      -> Ahora se usa pthread_mutex_lock/unlock alrededor de editor_save_to_disk().
+//   3) La confirmación de sobrescritura leía UN solo byte con read(). Como la terminal
+//      está configurada con VMIN=0/VTIME=1, read() puede devolver 0 (ninguna tecla en
+//      ese instante) en vez de bloquear esperando al usuario, y el código lo trataba
+//      como si el usuario hubiera cancelado.
+//      -> Ahora se reintenta la lectura hasta recibir realmente un byte.
+void editor_save_as(void)
 {
-    Linea *l = E.primer_linea;
-    for (int i = 0; i < indice && l != NULL; i++)
-    {
-        l = l->siguiente;
-    }
-    return l;
-}
-
-// --- Guardar como ---
-
-void editor_save_as(void) {
     char nuevo_nombre[MAX_FILENAME];
     char mensaje[256];
     int i = 0;
     char c;
 
-    // Limpiar el buffer de entrada
     tcflush(STDIN_FILENO, TCIFLUSH);
 
-    // Mostrar mensaje para nuevo nombre
-    snprintf(mensaje, sizeof(mensaje), "Guardar como: %s", E.filename);
-    editor_draw_footer(mensaje);
-    editor_refresh_screen();
-
-    // Inicializar el buffer
     memset(nuevo_nombre, 0, sizeof(nuevo_nombre));
+    snprintf(mensaje, sizeof(mensaje), " Guardar como: %s", nuevo_nombre);
+    editor_draw_footer(mensaje);
 
-    // Leer caracteres hasta ENTER o ESC
-    while (1) {
-        if (read(STDIN_FILENO, &c, 1) != 1) continue;
+    // Leer el nuevo nombre de archivo carácter por carácter hasta ENTER o ESC
+    while (1)
+    {
+        if (read(STDIN_FILENO, &c, 1) != 1)
+            continue; // sin tecla todavía (timeout de VTIME): seguir esperando
 
-        // Si es ENTER, terminar
-        if (c == '\r' || c == '\n') {
-            if (i > 0) {
+        if (c == '\r' || c == '\n')
+        {
+            if (i > 0)
+            {
                 nuevo_nombre[i] = '\0';
                 break;
             }
-            continue;
+            continue; // no se permite guardar con nombre vacío
         }
 
-        // Si es ESC, cancelar
-        if (c == '\x1b') {
+        if (c == '\x1b')
+        {
             editor_draw_footer(" Operación cancelada ");
             sleep(1);
             return;
         }
 
-        // Si es Backspace
-        if (c == 127 || c == CTRL_KEY('h')) {
-            if (i > 0) {
+        if (c == 127 || c == CTRL_KEY('h'))
+        {
+            if (i > 0)
+            {
                 i--;
                 nuevo_nombre[i] = '\0';
-                // Actualizar mensaje
-                snprintf(mensaje, sizeof(mensaje), "Guardar como: %s", nuevo_nombre);
+                snprintf(mensaje, sizeof(mensaje), " Guardar como: %s", nuevo_nombre);
                 editor_draw_footer(mensaje);
-                editor_refresh_screen();
             }
             continue;
         }
 
-        // Si es un caracter imprimible
-        if (isprint((unsigned char)c) && i < MAX_FILENAME - 1) {
+        if (isprint((unsigned char)c) && i < MAX_FILENAME - 1)
+        {
             nuevo_nombre[i++] = c;
             nuevo_nombre[i] = '\0';
-            // Actualizar mensaje
-            snprintf(mensaje, sizeof(mensaje), "Guardar como: %s", nuevo_nombre);
+            snprintf(mensaje, sizeof(mensaje), " Guardar como: %s", nuevo_nombre);
             editor_draw_footer(mensaje);
-            editor_refresh_screen();
         }
     }
 
-    // Verificar si el archivo ya existe
-    if (access(nuevo_nombre, F_OK) == 0) {
-        // El archivo existe, preguntar si sobrescribir
-        snprintf(mensaje, sizeof(mensaje), "¿Sobrescribir %s? (s/N): ", nuevo_nombre);
+    // Si el archivo ya existe, confirmar antes de sobrescribirlo
+    if (access(nuevo_nombre, F_OK) == 0)
+    {
+        snprintf(mensaje, sizeof(mensaje), " ¿Sobrescribir %.200s? (s/N): ", nuevo_nombre);
         editor_draw_footer(mensaje);
-        editor_refresh_screen();
 
-        // Esperar respuesta
-        char respuesta;
-        if (read(STDIN_FILENO, &respuesta, 1) == 1) {
-            if (respuesta != 's' && respuesta != 'S') {
-                editor_draw_footer(" Guardado cancelado ");
-                sleep(1);
-                return;
-            }
-        } else {
+        char respuesta = 0;
+        while (read(STDIN_FILENO, &respuesta, 1) != 1)
+            continue; // esperar de verdad a que el usuario responda
+
+        if (respuesta != 's' && respuesta != 'S')
+        {
             editor_draw_footer(" Guardado cancelado ");
             sleep(1);
             return;
         }
     }
 
-    // Guardar con el nuevo nombre
     strncpy(E.filename, nuevo_nombre, MAX_FILENAME - 1);
     E.filename[MAX_FILENAME - 1] = '\0';
 
-    // Guardar el archivo
+    pthread_mutex_lock(&E.mutex_buffer);
     editor_save_to_disk();
+    pthread_mutex_unlock(&E.mutex_buffer);
 
-    // Mostrar mensaje de éxito
     snprintf(mensaje, sizeof(mensaje), " Archivo guardado como: %s ", E.filename);
     editor_draw_footer(mensaje);
     sleep(1);
 }
 
-// --- Procesamiento de teclas ---
+// =====================================================================
+//  PROCESAMIENTO DE TECLAS
+// =====================================================================
 
+// Lee una tecla de la entrada estándar y ejecuta la acción correspondiente
+// (movimiento de cursor, edición de texto o un atajo de teclado).
 void editor_process_keypress()
 {
     char c;
     if (read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN)
         return;
 
-    // Secuencias de escape
+    // Secuencias de escape (flechas, Home/End, Delete)
     if (c == '\x1b')
     {
         char seq[3];
@@ -972,7 +991,6 @@ void editor_process_keypress()
             {
             case 'A': // Arriba
                 E.cy = (E.cy > 0) ? E.cy - 1 : 0;
-                // Ajustar línea actual al moverse
                 E.linea_actual = obtener_linea_por_indice(E.cy);
                 if (E.cx > E.linea_actual->longitud)
                     E.cx = E.linea_actual->longitud;
@@ -998,14 +1016,13 @@ void editor_process_keypress()
                 if (E.linea_actual)
                     E.cx = E.linea_actual->longitud;
                 break;
-            case '3': // Delete (puede ser \x1b[3~)
+            case '3': // Delete (secuencia \x1b[3~)
+            {
                 char next;
                 if (read(STDIN_FILENO, &next, 1) == 1 && next == '~')
-                {
                     borrar_caracter_derecha();
-                }
                 break;
-
+            }
             default:
                 break;
             }
@@ -1013,47 +1030,49 @@ void editor_process_keypress()
         return;
     }
 
-    // Teclas de control
+    // Atajos de teclado (Ctrl + tecla)
     switch (c)
     {
     case CTRL_KEY('q'):
         editor_shutdown();
         exit(0);
         break;
-    case CTRL_KEY('a'):  // <--- AGREGAR ESTE CASO
-        editor_save_as();  // Guardar como
+    case CTRL_KEY('a'): // Guardar como
+        editor_save_as();
         break;
-    case CTRL_KEY('c'):
-        // ... copiar ...
+    case CTRL_KEY('c'): // Copiar
+        pthread_mutex_lock(&E.mutex_buffer);
+        accion_copiar();
+        pthread_mutex_unlock(&E.mutex_buffer);
         break;
-    case CTRL_KEY('v'):
-        // ... pegar ...
+    case CTRL_KEY('v'): // Pegar
+        pthread_mutex_lock(&E.mutex_buffer);
+        accion_pegar();
+        pthread_mutex_unlock(&E.mutex_buffer);
         break;
     case 127: // Backspace
     case CTRL_KEY('h'):
         borrar_caracter_izquierda();
         break;
-    /*case CTRL_KEY('a'):
-        editor_save_as();
-        break;*/
-    case '\r': // ENTER - NUEVA LÍNEA
-    case '\n': // ENTER (alternativo)
+    case '\r': // Enter
+    case '\n':
         insertar_nueva_linea();
         break;
     default:
         if (isprint((unsigned char)c))
-        {
             insertar_caracter(c);
-        }
         break;
     }
 }
 
-// --- MAIN ---
+// =====================================================================
+//  PUNTO DE ENTRADA
+// =====================================================================
+
 int main(int argc, char *argv[])
 {
     enableRawMode();
-    limpiar_buffer_entrada();  // <--- ¡AGREGAR ESTA LÍNEA!
+    limpiar_buffer_entrada();
     initEditor();
 
     if (argc >= 2)
